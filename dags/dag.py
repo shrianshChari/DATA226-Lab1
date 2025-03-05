@@ -2,17 +2,23 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
-from pandas import DataFrame
+import pandas as pd
 import yfinance as yf
 import snowflake.connector
 
-def fetch_stock_data(stock_symbol, start_date, end_date):
+
+def fetch_stock_data(stock_symbol: str, start_date: str, end_date: str):
     """Fetch stock data from yfinance."""
     stock = yf.download(stock_symbol, start=start_date, end=end_date)
-    stock.reset_index(inplace=True)
-    return stock
+    if stock is not None:
+        stock.reset_index(inplace=True)
+        stock["Symbol"] = stock_symbol
+        stock.columns = stock.columns.droplevel(1)
+        return stock
+    else:
+        raise ValueError('Stock information is None.')
 
-def load_to_snowflake(symbol: str, stock_data: DataFrame, table_name: str,
+def load_to_snowflake(stock_data: pd.DataFrame, table_name: str,
                       database: str = 'dev', schema: str = 'stock_schema'):
     """Load data into Snowflake."""
     conn = snowflake.connector.connect(
@@ -21,9 +27,6 @@ def load_to_snowflake(symbol: str, stock_data: DataFrame, table_name: str,
         account=Variable.get('snowflake_account')
     )
     cursor = conn.cursor()
-
-    if (not table_name.endswith(symbol)):
-        table_name = table_name + "_" + symbol.upper()
 
     try:
         cursor.execute("BEGIN;")
@@ -49,8 +52,8 @@ def load_to_snowflake(symbol: str, stock_data: DataFrame, table_name: str,
         for _, row in stock_data.iterrows():
             insert_query = f"""
             INSERT INTO {database}.{schema}.{table_name} (stock_symbol, date, open, close, min, max, volume)
-            VALUES ('{symbol}', TO_DATE('{row["Date"].item()}'), {row["Open"].item()},
-            {row["Close"].item()}, {row["Low"].item()}, {row["High"].item()}, {row["Volume"].item()});
+            VALUES ('{row["Symbol"]}', TO_DATE('{row["Date"]}'), {row["Open"]},
+            {row["Close"]}, {row["Low"]}, {row["High"]}, {row["Volume"]});
             """
             # logging.info(insert_query)
             cursor.execute(insert_query)
@@ -74,10 +77,16 @@ def etl_task(**kwargs):
     schema = 'stock_schema'
     table_name = 'STOCK_PRICES'
 
+    total_data = None
     for symbol in stock_symbols:
         stock_data = fetch_stock_data(symbol, start_date, end_date)
-        if stock_data is not None:
-            load_to_snowflake(symbol, stock_data, table_name, database, schema)
+        if total_data is None:
+            total_data = stock_data
+        else:
+            total_data = pd.concat([total_data, stock_data], ignore_index=True)
+
+    if total_data is not None:
+        load_to_snowflake(total_data, table_name, database, schema)
 
 # Default arguments for the DAG
 default_args = {
