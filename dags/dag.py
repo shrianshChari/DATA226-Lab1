@@ -1,92 +1,13 @@
 from datetime import datetime, timedelta
 from airflow import DAG
+from airflow.decorators import task, dag
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 import pandas as pd
 import yfinance as yf
 import snowflake.connector
 
-
-def fetch_stock_data(stock_symbol: str, start_date: str, end_date: str):
-    """Fetch stock data from yfinance."""
-    stock = yf.download(stock_symbol, start=start_date, end=end_date)
-    if stock is not None:
-        stock.reset_index(inplace=True)
-        stock["Symbol"] = stock_symbol
-        stock.columns = stock.columns.droplevel(1)
-        return stock
-    else:
-        raise ValueError('Stock information is None.')
-
-def load_to_snowflake(stock_data: pd.DataFrame, table_name: str,
-                      database: str = 'dev', schema: str = 'stock_schema'):
-    """Load data into Snowflake."""
-    conn = snowflake.connector.connect(
-        user=Variable.get('snowflake_user'),
-        password=Variable.get('snowflake_password'),
-        account=Variable.get('snowflake_account')
-    )
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute("BEGIN;")
-
-        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {database};")
-        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {database}.{schema};")
-
-        create_table_query = f"""
-        CREATE TABLE IF NOT EXISTS {database}.{schema}.{table_name} (
-            stock_symbol STRING,
-            date DATE,
-            open FLOAT,
-            close FLOAT,
-            min FLOAT,
-            max FLOAT,
-            volume BIGINT
-        );"""
-        cursor.execute(create_table_query)
-
-        cursor.execute(f"DELETE FROM {database}.{schema}.{table_name};")
-
-        # Insert data
-        for _, row in stock_data.iterrows():
-            insert_query = f"""
-            INSERT INTO {database}.{schema}.{table_name} (stock_symbol, date, open, close, min, max, volume)
-            VALUES ('{row["Symbol"]}', TO_DATE('{row["Date"]}'), {row["Open"]},
-            {row["Close"]}, {row["Low"]}, {row["High"]}, {row["Volume"]});
-            """
-            # logging.info(insert_query)
-            cursor.execute(insert_query)
-
-        cursor.execute("COMMIT;")
-    except Exception as e:
-        cursor.execute("ROLLBACK;")
-        print(e)
-        raise e
-    finally:
-        cursor.close()
-        conn.close()
-
-def etl_task(**kwargs):
-    """Main ETL task to fetch stock data and load it into Snowflake."""
-    stock_symbols = ['AAPL', 'NVDA']  # Add more symbols as needed
-    start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
-    end_date = datetime.now().strftime('%Y-%m-%d')
-
-    database = 'dev'
-    schema = 'stock_schema'
-    table_name = 'STOCK_PRICES'
-
-    total_data = None
-    for symbol in stock_symbols:
-        stock_data = fetch_stock_data(symbol, start_date, end_date)
-        if total_data is None:
-            total_data = stock_data
-        else:
-            total_data = pd.concat([total_data, stock_data], ignore_index=True)
-
-    if total_data is not None:
-        load_to_snowflake(total_data, table_name, database, schema)
+stock_symbols = ['AAPL', 'NVDA']  # Add more symbols as needed
 
 # Default arguments for the DAG
 default_args = {
@@ -98,21 +19,103 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-# Define the DAG
-dag = DAG(
+@dag(
     'yfinance_to_snowflake',
     default_args=default_args,
     description='Fetch stock prices and load into Snowflake',
     schedule_interval='@daily',  # Runs daily
     start_date=datetime(2025, 3, 1),  # Update the start date as needed
-    catchup=False,
+    catchup=False
 )
+def etl_dag():
+    @task
+    def extract(stock_symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """Fetch stock data from yfinance."""
+        stock = yf.download(stock_symbol, start=start_date, end=end_date)
+        if stock is not None:
+            return stock
+        else:
+            raise ValueError('Stock information is None.')
 
-# Define the PythonOperator
-etl_task = PythonOperator(
-    task_id='fetch_and_load_stock_data',
-    python_callable=etl_task,
-    dag=dag
-)
+    @task
+    def transform(raw_data: pd.DataFrame) -> pd.DataFrame:
+        stock_symbol = raw_data.columns.get_level_values(1).unique()[-1]
 
-etl_task
+        raw_data.reset_index(inplace=True)
+        raw_data["Symbol"] = stock_symbol
+        raw_data.columns = raw_data.columns.droplevel(1)
+        return raw_data
+
+    @task
+    def combine_transformed_data(transformed_dfs: list[pd.DataFrame]) -> pd.DataFrame:
+        return pd.concat(transformed_dfs, ignore_index=True)
+
+    @task
+    def load(stock_data: pd.DataFrame, table_name: str,
+                          database: str = 'dev', schema: str = 'stock_schema'):
+        """Load data into Snowflake."""
+        conn = snowflake.connector.connect(
+            user=Variable.get('snowflake_user'),
+            password=Variable.get('snowflake_password'),
+            account=Variable.get('snowflake_account')
+        )
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("BEGIN;")
+
+            cursor.execute(f"CREATE DATABASE IF NOT EXISTS {database};")
+            cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {database}.{schema};")
+
+            create_table_query = f"""
+            CREATE TABLE IF NOT EXISTS {database}.{schema}.{table_name} (
+                stock_symbol STRING,
+                date DATE,
+                open FLOAT,
+                close FLOAT,
+                min FLOAT,
+                max FLOAT,
+                volume BIGINT
+            );"""
+            cursor.execute(create_table_query)
+
+            cursor.execute(f"DELETE FROM {database}.{schema}.{table_name};")
+
+            # Insert data
+            for _, row in stock_data.iterrows():
+                insert_query = f"""
+                INSERT INTO {database}.{schema}.{table_name} (stock_symbol, date, open, close, min, max, volume)
+                VALUES ('{row["Symbol"]}', TO_DATE('{row["Date"]}'), {row["Open"]},
+                {row["Close"]}, {row["Low"]}, {row["High"]}, {row["Volume"]});
+                """
+                # logging.info(insert_query)
+                cursor.execute(insert_query)
+
+            cursor.execute("COMMIT;")
+        except Exception as e:
+            cursor.execute("ROLLBACK;")
+            print(e)
+            raise e
+        finally:
+            cursor.close()
+            conn.close()
+
+    start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+    end_date = datetime.now().strftime('%Y-%m-%d')
+
+    database = 'dev'
+    schema = 'stock_schema'
+    table_name = 'STOCK_PRICES'
+
+    transformed_dfs = []
+    for symbol in stock_symbols:
+        raw_data = extract(symbol, start_date, end_date)
+        stock_data = transform(raw_data)
+        transformed_dfs.append(stock_data)
+    
+    total_data = combine_transformed_data(transformed_dfs)
+
+    if total_data is not None:
+        load(total_data, table_name, database, schema)
+
+etl_dag()
