@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import logging
 
 from airflow.decorators import task, dag
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 import pandas as pd
 import yfinance as yf
 import snowflake.connector
@@ -122,7 +123,14 @@ def etl_dag():
 
     total_data = combine_transformed_data(transformed_dfs)
 
-    load(cursor, total_data, table_name, database, schema)
+    load_task_instance = load(cursor, total_data, table_name, database, schema)
+
+    trigger_task_instance = TriggerDagRunOperator(
+        task_id="trigger_forecasting",
+        trigger_dag_id="train_predict_model"
+    )
+
+    load_task_instance >> trigger_task_instance
 
 
 etl_dag()
